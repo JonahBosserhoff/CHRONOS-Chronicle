@@ -104,19 +104,26 @@ CHRONOS/
 │   │   ├── dataset.py              # Target-trial dataset construction
 │   │   ├── model.py                # CHRONOS model and neural components
 │   │   ├── train.py                # Training and edge-level estimation
-│   │   └── run_all_trials.py       # Utilities for running multiple disease-pair trials
+│   │   ├── run_all_trials.py       # Utilities for running multiple disease-pair trials
+│   │   ├── dataset_os.py           # Chronicle cohorts -> daily sequences (Chronicle benchmark)
+│   │   ├── train_os.py             # CHRONOS backbone + one head for any Chronicle target
+│   │   ├── validate_os.py          # external validation with the training cohort's scalers
+│   │   └── chronicle_compat.py     # Chronicle losses, metrics and scalers, copied (standalone)
 │   │
 │   ├── experiment_suite.py         # Ablation and sensitivity experiment runner
 │   ├── baseline_compare.py         # Baseline comparison script
 │   ├── cox_baseline.py             # Cox-style baseline analysis
 │   └── run_all_cox.py              # Batch execution for Cox-style baselines
 │
+├── configs/validate_external.yaml  # Options of an external validation (Chronicle benchmark)
+├── slurm/                          # SLURM jobs: train, validate (Chronicle benchmark)
 ├── chronos_example_data/           # Synthetic toy data for input-format illustration
 ├── ablation/                       # Supplementary ablation outputs
 ├── baseline_compare/               # Supplementary baseline-comparison outputs
 ├── fig/                            # Architecture diagram and additional figures
 ├── MASTER_COX_DX_DX.csv            # Aggregated Cox-style edge-level results
 ├── LICENSE
+├── RUN_CHRONICLE.md                # How to run the Chronicle benchmark
 └── README.md
 ```
 
@@ -224,6 +231,27 @@ ENDO -> DIGE
 ```
 
 that is, the estimated contribution of an endocrine/metabolic disease category to the subsequent risk of a digestive disease category within the specified follow-up window.
+
+## Benchmark on Chronicle Cohorts
+
+`src/chronos/train_os.py` runs the CHRONOS backbone as a single-target baseline on the cohorts
+of Chronicle: overall survival (`OS`), time to next treatment (`TTNT`) or any `label_*` target,
+with Chronicle's loss and metric for that target. `src/chronos/validate_os.py` validates a
+trained model on an external cohort, scaled with the training cohort's scalers. Both are
+standalone (nothing is imported from Chronicle); the original causal pipeline above is unchanged.
+
+| | causal CHRONOS (`train.py`) | Chronicle benchmark (`train_os.py`) |
+|---|---|---|
+| input | event CSV (ICD-9 macro / ATC codes, absolute dates) | Chronicle's own split CSVs, read unchanged (long format, days since diagnosis, scaled by Chronicle) |
+| features | indicator of A, counts of B, age, sex, frailty | every Chronicle feature (schema ∩ data); age and sex in the static MLP |
+| time axis | visit days of the 180-day baseline window before t0 | every observed day since diagnosis |
+| model | static MLP + GRU + fusion → mu0 / mu1 / propensity | static MLP + GRU + fusion → one head |
+| objective | BCE + propensity + contrastive + MINE, AIPW | Chronicle's loss: Cox (survival), MSE (regression), BCE (binary) |
+| output | one ATE per disease edge | a prediction for every (patient, day) |
+
+How to run it (locally or as SLURM jobs), every option, and the exact design changes against the
+original CHRONOS:
+[RUN_CHRONICLE.md](RUN_CHRONICLE.md).
 
 ## Running the Experiment Suite
 

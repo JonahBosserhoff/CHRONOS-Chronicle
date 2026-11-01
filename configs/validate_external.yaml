@@ -1,0 +1,28 @@
+# External validation of a model trained by src/chronos/train_os.py.
+#
+#   python src/chronos/validate_os.py --config configs/validate_external.yaml
+#   sbatch --export=ALL,CONFIG=configs/validate_external.yaml slurm/validate.sbatch
+#
+# Keys are the options of validate_os.py without "--". Options given on the command line override
+# this file (e.g. `... --config <this file> --seed 1`). null = the default named in the comment.
+# Relative paths resolve from the directory the command runs in (slurm/validate.sbatch: the
+# repository root). ~ and $VARS are expanded. Copy this file once per model and external cohort.
+
+# ---- required ---------------------------------------------------------------------------------
+checkpoint: results_os/OS/checkpoints/best_model.pt   # best_model.pt (or last_model.pt) of train_os.py
+data: /path/to/site_b/site_b.csv                      # RAW (unscaled) external cohort: the CSV, or its directory
+out_dir: results_os/OS_site_b                         # metrics_external.json, predictions_external/, validation_config.json
+
+# ---- scalers and schema of the TRAINING cohort ------------------------------------------------
+scaler_dir: null             # null = the training cohort's scalers/ recorded in the checkpoint
+allow_other_scalers: false   # true = accept scalers whose sha256 differs from the training ones
+global_format: null          # null = the feature schema recorded in the checkpoint
+
+# ---- which patients ---------------------------------------------------------------------------
+patient_ids: null            # CSV with a patient_id column to restrict to; null = every patient
+
+# ---- inference --------------------------------------------------------------------------------
+eval_batch_size: null        # null = the training run's (eval_batch_size, else batch_size)
+c_index_samples: null        # null = the training run's (survival targets: draws for C-index mean ± std)
+seed: null                   # null = the training run's (fixes the C-index draws)
+num_workers: 0

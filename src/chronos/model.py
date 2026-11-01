@@ -131,6 +131,48 @@ class CHRONOSModel(nn.Module):
         return logits, z_fused, h, e_logit
 
 
+class CHRONOSSingleTaskModel(CHRONOSModel):
+    """CHRONOS backbone with the causal layer replaced by one prediction head.
+
+    Static MLP, GRU and fusion are CHRONOS's. The mu0/mu1 and propensity heads need an
+    exposure and are dropped; the head mirrors the outcome heads and emits one value per
+    timestep: a log-risk for a survival target (higher = higher hazard, Cox loss), the
+    prediction for a regression target, a logit for a binary target. The GRU is causal, so
+    the output at day t only depends on days <= t.
+    """
+
+    def __init__(
+        self,
+        cov_dim: int,
+        latent_dim: int = 64,
+        rnn_layers: int = 1,
+        dropout: float = 0.1,
+        static_dim: int = 3,
+    ):
+        super().__init__(
+            cov_dim=cov_dim,
+            prev_treat_dim=0,
+            latent_dim=latent_dim,
+            rnn_layers=rnn_layers,
+            dropout=dropout,
+            n_treatments=1,
+            n_outcomes=1,
+            static_dim=static_dim,
+        )
+        del self.mu0_head, self.mu1_head, self.propensity_head
+        self.head = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(latent_dim, 1),
+        )
+
+    def forward(self, current_covariates: torch.Tensor) -> torch.Tensor:
+        no_treatments = current_covariates.new_zeros(*current_covariates.shape[:2], 0)
+        z_fused, _ = self.encode(current_covariates, no_treatments)
+        return self.head(z_fused).squeeze(-1)
+
+
 def contrastive_loss_from_batch(
     z_flat: torch.Tensor,
     tau_flat: torch.Tensor,
