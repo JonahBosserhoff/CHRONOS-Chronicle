@@ -47,6 +47,8 @@ one is refused.
 
 sbatch --export=ALL,DATA=$DATA,GLOBAL_FORMAT=$SCHEMA,TARGET=OS slurm/train.sbatch
 
+sbatch slurm/train.sbatch TTNT
+
 ```bash
 python src/chronos/train_os.py \
   --data <cohort_dir> \
