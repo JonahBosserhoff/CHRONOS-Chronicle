@@ -10,12 +10,19 @@ scalers. Every patient becomes one timestep per observed day:
 
     static     [value, observed] per static feature (age, sex)     -> CHRONOS static MLP
     dynamic    per feature: last value of the day (+ observed mask) -> CHRONOS GRU
-    time       years since diagnosis, years since the previous observed day
+    time       years since diagnosis, years since the previous observed day (--time_features)
     label      the target of the day's first row (what Chronicle's CLS token clones):
                [time, event] for survival targets, [value] for regression / binary targets
 
 The days are Chronicle's: every day with an observation of a vocabulary feature (schema ∩
 data, optionally narrowed by `input_features`). Columns are ordered by the schema's global_id.
+
+Two options bring the input closer to the original CHRONOS, whose GRU had no time feature and
+saw at most `max_seq_len` = 60 visit days (both are off by default and recorded in the layout):
+
+    time_features  "both" (default), "since_diagnosis" or "none"
+    max_seq_len    0 (default) = the whole history; N = the prediction at a day only sees the
+                   last N observed days, that day included (`window_inputs`)
 """
 
 import os
@@ -38,8 +45,13 @@ VALUE_COL = "feature_value"
 
 DEFAULT_STATIC_FEATURES = ["age_at_diagnosis", "gender_female"]
 SPLITS = ("train", "val", "test")
-N_TIME_FEATURES = 2
 DAYS_PER_YEAR = 365.25
+TIME_FEATURES = ("years_since_diagnosis", "years_since_previous_day")
+TIME_FEATURE_CHOICES = {
+    "both": list(TIME_FEATURES),
+    "since_diagnosis": ["years_since_diagnosis"],
+    "none": [],
+}
 
 
 def resolve_split_csvs(data_path: str) -> Dict[str, str]:
@@ -141,11 +153,23 @@ def build_vocab(
     return sorted(vocab)
 
 
+def time_feature_names(layout: Dict) -> List[str]:
+    """The time columns of a layout (a checkpoint from before --time_features has both)."""
+    return list(layout.get("time_features", TIME_FEATURES))
+
+
+def history_cap(layout: Dict) -> int:
+    """`max_seq_len` of a layout: 0 = the whole history (also for checkpoints from before the option)."""
+    return int(layout.get("max_seq_len") or 0)
+
+
 def build_layout(
     schema_csv: str,
     frames: Dict[str, pd.DataFrame],
     static_features: Sequence[str],
     input_features: Optional[Sequence[str]] = None,
+    time_features: str = "both",
+    max_seq_len: int = 0,
 ) -> Dict:
     """Decide which feature goes to which input column. Fitted on the training cohort.
 
@@ -153,7 +177,15 @@ def build_layout(
     train values are all 1 (ICD, OPS, substances, metastases, ...) only exist as "documented",
     so a single presence column carries all their information. Other categoricals (TNM, ECOG,
     gender) keep value + mask, since 0 is a real value there.
+
+    `time_features` picks the time columns, `max_seq_len` caps the history (0 = no cap); both are
+    stored here so that external validation and the feature ablation use the training inputs.
     """
+    if time_features not in TIME_FEATURE_CHOICES:
+        raise ValueError(f"time_features must be one of {sorted(TIME_FEATURE_CHOICES)}, got {time_features!r}.")
+    if max_seq_len < 0:
+        raise ValueError(f"max_seq_len must be 0 (whole history) or positive, got {max_seq_len}.")
+    times = TIME_FEATURE_CHOICES[time_features]
     schema = read_schema(schema_csv)
     vocab = build_vocab(schema, list(frames.values()), input_features)
 
@@ -177,7 +209,8 @@ def build_layout(
         if not presence_only:
             mask_col[f] = len(columns)
             columns.append({"column": len(columns), "feature": f, "kind": "observed", "schema_type": feat_type[f]})
-    for name in ("years_since_diagnosis", "years_since_previous_day"):
+    n_dynamic = len(columns)
+    for name in times:
         columns.append({"column": len(columns), "feature": name, "kind": "time", "schema_type": "time"})
 
     return {
@@ -188,8 +221,10 @@ def build_layout(
         "value_col": value_col,
         "mask_col": mask_col,
         "presence_only": sorted(f for f in dynamic if f not in mask_col),
-        "n_dynamic": len(columns) - N_TIME_FEATURES,
+        "n_dynamic": n_dynamic,
         "static_dim": 2 * len(static),
+        "time_features": times,
+        "max_seq_len": int(max_seq_len),
         "columns": columns,
     }
 
@@ -363,6 +398,11 @@ def encode_split(
     return records
 
 
+def describe_history(layout: Dict) -> str:
+    cap = history_cap(layout)
+    return f"last {cap} observed days per prediction (max_seq_len)" if cap else "whole history since diagnosis"
+
+
 def describe(name: str, ds: "ChronicleOSDataset"):
     n_days = np.array([len(r["days"]) for r in ds.records])
     labelled = np.array([int((~np.isnan(r["labels"]).any(axis=1)).sum()) for r in ds.records])
@@ -381,6 +421,8 @@ def load_chronicle_cohort(
     recurrent: bool = False,
     static_features: Sequence[str] = DEFAULT_STATIC_FEATURES,
     input_features: Optional[Sequence[str]] = None,
+    time_features: str = "both",
+    max_seq_len: int = 0,
 ):
     """The three splits of `chronicle-preprocess` and the input layout fitted on them."""
     csvs = resolve_split_csvs(data_path)
@@ -389,12 +431,13 @@ def load_chronicle_cohort(
         frames[split] = read_cohort_csv(path)
         print(f"📄 {split}: {path} ({frames[split][PATIENT_ID_COL].nunique()} patients, {len(frames[split])} rows)")
 
-    layout = build_layout(schema_csv, frames, static_features, input_features)
+    layout = build_layout(schema_csv, frames, static_features, input_features, time_features, max_seq_len)
     print(
         f"Vocabulary: {len(layout['vocab'])} features | static: {layout['static']} | "
         f"dynamic columns: {layout['n_dynamic']} ({len(layout['presence_only'])} presence-only) "
-        f"+ {N_TIME_FEATURES} time"
+        f"+ {len(layout['time_features'])} time {layout['time_features']}"
     )
+    print(f"History: {describe_history(layout)}")
 
     datasets = {
         split: ChronicleOSDataset(encode_split(df, layout, target, task, recurrent=recurrent, name=split))
@@ -442,26 +485,52 @@ def collate_os(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     }
 
 
-def densify(batch: Dict[str, torch.Tensor], static_dim: int, n_dynamic: int, device, lengths=None) -> torch.Tensor:
+def densify(batch: Dict[str, torch.Tensor], layout: Dict, device, lengths=None) -> torch.Tensor:
     """Build CHRONOS's `current_covariates` [B, T, static | dynamic | time].
 
     The static block is only filled at t=0, which is the only step CHRONOSModel.encode reads
     it from. `lengths` cuts patients short (survival training uses the history up to the
-    sampled day).
+    sampled day). The time block holds the layout's `time_features` (none, one or both).
     """
+    static_dim, n_dynamic = layout["static_dim"], layout["n_dynamic"]
+    times = time_feature_names(layout)
     lengths = batch["lengths"] if lengths is None else lengths
     B, T = len(lengths), int(lengths.max())
-    cov = torch.zeros(B, T, static_dim + n_dynamic + N_TIME_FEATURES, device=device)
+    cov = torch.zeros(B, T, static_dim + n_dynamic + len(times), device=device)
     cov[:, 0, :static_dim] = batch["static"].to(device)
 
     b, t, c, v = batch["b_idx"], batch["t_idx"], batch["c_idx"], batch["vals"]
     keep = t < lengths[b]
     cov[b[keep].to(device), t[keep].to(device), (static_dim + c[keep]).to(device)] = v[keep].to(device)
 
-    valid = (torch.arange(T)[None, :] < lengths[:, None]).float()
-    days = batch["days"][:, :T]
-    delta = torch.zeros_like(days)
-    delta[:, 1:] = days[:, 1:] - days[:, :-1]
-    cov[:, :, -2] = (days / DAYS_PER_YEAR * valid).to(device)
-    cov[:, :, -1] = (delta / DAYS_PER_YEAR * valid).to(device)
+    if times:
+        valid = (torch.arange(T)[None, :] < lengths[:, None]).float()
+        days = batch["days"][:, :T]
+        delta = torch.zeros_like(days)
+        delta[:, 1:] = days[:, 1:] - days[:, :-1]
+        values = {"years_since_diagnosis": days, "years_since_previous_day": delta}
+        for k, name in enumerate(times):
+            cov[:, :, static_dim + n_dynamic + k] = (values[name] / DAYS_PER_YEAR * valid).to(device)
     return cov
+
+
+def window_inputs(cov: torch.Tensor, rows: torch.Tensor, ends: torch.Tensor, max_seq_len: int, static_dim: int):
+    """The original CHRONOS's `max_seq_len`: the prediction at day `ends[k]` of patient `rows[k]`
+    only sees that patient's last `max_seq_len` observed days, that day included, run from a
+    fresh GRU state.
+
+    Returns the windows [N, L, F] and the position of day `ends[k]` in window k. The windows
+    are left-aligned with zeros after that day; the GRU is causal, so the zeros never reach
+    the output there. The static block goes to step 0 of every window (the only step
+    CHRONOSModel.encode reads it from). Time features keep their values, so years since the
+    previous day refers to the real previous day, also when that day lies before the window.
+    """
+    starts = (ends - max_seq_len + 1).clamp(min=0)
+    n = ends - starts + 1
+    L = int(n.max())
+    offsets = torch.arange(L, device=cov.device)
+    inside = offsets[None, :] < n[:, None]
+    idx = torch.where(inside, starts[:, None] + offsets[None, :], starts[:, None])
+    windows = cov[rows[:, None], idx] * inside.unsqueeze(-1).to(cov.dtype)
+    windows[:, 0, :static_dim] = cov[rows, 0, :static_dim]
+    return windows, n - 1

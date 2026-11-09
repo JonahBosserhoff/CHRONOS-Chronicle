@@ -20,6 +20,10 @@ Example:
       --data <chronicle>/data/essen_new_labels \
       --global_format <chronicle>/data/global_format_essen_12_03.csv \
       --target OS --out_dir results_os/chronos_OS
+
+or with the options in a YAML file (template: configs/train.yaml); options given on the command
+line override the file, and {target} in --out_dir becomes the target:
+    python src/chronos/train_os.py --config configs/train.yaml --target TTNT
 """
 
 import argparse
@@ -33,6 +37,8 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader
+
+DEFAULT_WINDOW_BATCH_SIZE = 8192
 
 from chronicle_compat import (
     DEFAULT_BINARY_LABEL_COLS,
@@ -50,7 +56,17 @@ from chronicle_compat import (
     scaler_fingerprint,
     task_type,
 )
-from dataset_os import DEFAULT_STATIC_FEATURES, collate_os, densify, load_chronicle_cohort
+from dataset_os import (
+    DEFAULT_STATIC_FEATURES,
+    TIME_FEATURE_CHOICES,
+    collate_os,
+    densify,
+    history_cap,
+    load_chronicle_cohort,
+    time_feature_names,
+    window_inputs,
+)
+from cli_config import parse_args as parse_with_config
 from model import CHRONOSSingleTaskModel
 
 
@@ -85,6 +101,64 @@ def make_loader(dataset, batch_size: int, shuffle: bool, drop_last: bool, num_wo
 
 
 # --------------------------------------------------------------------------- #
+# Capped history (--max_seq_len, as in the original CHRONOS)
+# --------------------------------------------------------------------------- #
+
+def window_outputs(model, cov, rows, ends, layout) -> torch.Tensor:
+    """Output at day ends[k] of patient rows[k], from its last max_seq_len days only. [N]"""
+    windows, last = window_inputs(cov, rows, ends, history_cap(layout), layout["static_dim"])
+    return model(windows)[torch.arange(len(last), device=windows.device), last]
+
+
+def capped_outputs(model, cov, lengths, layout, window_batch_size: int) -> torch.Tensor:
+    """Inference with --max_seq_len: the output at every observed day, each from its own window,
+    `window_batch_size` windows per forward pass. [B, T], 0 on padding."""
+    rows, ends = valid_mask(lengths, cov.shape[1]).nonzero(as_tuple=True)
+    rows, ends = rows.to(cov.device), ends.to(cov.device)
+    out = cov.new_zeros(cov.shape[0], cov.shape[1])
+    for s in range(0, len(rows), window_batch_size):
+        part = slice(s, s + window_batch_size)
+        out[rows[part], ends[part]] = window_outputs(model, cov, rows[part], ends[part], layout).to(out.dtype)
+    return out
+
+
+def capped_dense_step(model, batch, layout, spec, loss_fn, mtl, device, args) -> Optional[float]:
+    """Forward and backward of one regression / binary batch with --max_seq_len.
+
+    Every labelled day is its own window, often too many for one forward pass, so the windows
+    go through in chunks of --window_batch_size with one backward each. The gradients add up
+    to those of one pass over all windows: the loss is the same mean over the labelled days
+    (each chunk weighted by its share), and Chronicle's MultiTaskLoss is linear in the task
+    loss, so its derivative by the loss is applied to every chunk; the learned log-variance of
+    --loss_mode uncertainty gets its gradient once, from the full loss.
+    """
+    lengths, labels = batch["lengths"], batch["labels"]
+    labelled = valid_mask(lengths, int(lengths.max())) & ~torch.isnan(labels).any(dim=-1)
+    rows, ends = labelled.nonzero(as_tuple=True)
+    n = len(rows)
+    if n == 0:
+        return None
+    y_true = labels[rows, ends].to(device)
+    rows, ends = rows.to(device), ends.to(device)
+    cov = densify(batch, layout, device)
+
+    probe = torch.zeros((), device=device, requires_grad=True)
+    (d_total,) = torch.autograd.grad(mtl.compute_loss({spec["target"]: probe}, batch_size=args.batch_size), probe)
+    loss = 0.0
+    for s in range(0, n, args.window_batch_size):
+        part = slice(s, s + args.window_batch_size)
+        y_pred = window_outputs(model, cov, rows[part], ends[part], layout).unsqueeze(-1)
+        chunk = loss_fn(y_pred, y_true[part]) * (y_pred.shape[0] / n)
+        chunk.backward(d_total.detach())
+        loss += float(chunk.detach())
+
+    total = mtl.compute_loss({spec["target"]: torch.tensor(loss, device=device)}, batch_size=args.batch_size)
+    if total.requires_grad:
+        total.backward()
+    return float(total.detach())
+
+
+# --------------------------------------------------------------------------- #
 # Training
 # --------------------------------------------------------------------------- #
 
@@ -96,6 +170,8 @@ def batch_loss(model, batch, layout, spec, loss_fn, device, survival_sampling: s
     at its drawn day before the forward pass: the GRU is causal, so the output at that day is
     the one a full pass would give, without running the GRU over the days after it.
     Regression / binary: every labelled day, NaN labels dropped.
+    With --max_seq_len the survival prediction comes from the drawn day's window
+    (regression / binary then train through capped_dense_step).
     """
     lengths, labels = batch["lengths"], batch["labels"]
     B, T = len(lengths), int(lengths.max())
@@ -111,11 +187,15 @@ def batch_loss(model, batch, layout, spec, loss_fn, device, survival_sampling: s
         rows, days = chosen[:, 0].long(), chosen[:, 1].long()
         cut = torch.ones_like(lengths)
         cut[rows] = days + 1
-        out = model(densify(batch, layout["static_dim"], layout["n_dynamic"], device, lengths=cut))
-        y_pred = out[rows.to(device), days.to(device)].unsqueeze(-1)
+        cov = densify(batch, layout, device, lengths=cut)
+        rows, days = rows.to(device), days.to(device)
+        if history_cap(layout):
+            y_pred = window_outputs(model, cov, rows, days, layout).unsqueeze(-1)
+        else:
+            y_pred = model(cov)[rows, days].unsqueeze(-1)
         return loss_fn(y_pred, y_true.to(device))
 
-    out = model(densify(batch, layout["static_dim"], layout["n_dynamic"], device)).unsqueeze(-1)
+    out = model(densify(batch, layout, device)).unsqueeze(-1)
     m = mask.to(device)
     y_true = labels.to(device)[m]
     y_pred = out[m]
@@ -126,19 +206,29 @@ def batch_loss(model, batch, layout, spec, loss_fn, device, survival_sampling: s
     return loss_fn(y_pred, y_true)
 
 
+def train_step(model, batch, layout, spec, loss_fn, mtl, device, args) -> Optional[float]:
+    """Forward and backward of one batch; its loss, or None when it has no usable label."""
+    if history_cap(layout) and spec["task"] != SURVIVAL:
+        return capped_dense_step(model, batch, layout, spec, loss_fn, mtl, device, args)
+    loss = batch_loss(model, batch, layout, spec, loss_fn, device, args.survival_sampling)
+    if loss is None:
+        return None
+    loss = mtl.compute_loss({spec["target"]: loss}, batch_size=args.batch_size)
+    loss.backward()
+    return float(loss.detach())
+
+
 def train_epoch(model, loader, layout, spec, loss_fn, mtl, opt, device, args) -> float:
     model.train()
     total, n = 0.0, 0
     for batch in loader:
         opt.zero_grad(set_to_none=True)
-        loss = batch_loss(model, batch, layout, spec, loss_fn, device, args.survival_sampling)
+        loss = train_step(model, batch, layout, spec, loss_fn, mtl, device, args)
         if loss is None:
             continue
-        loss = mtl.compute_loss({spec["target"]: loss}, batch_size=args.batch_size)
-        loss.backward()
         torch.nn.utils.clip_grad_norm_(list(model.parameters()) + mtl.parameters(), 1.0)
         opt.step()
-        total += float(loss.detach())
+        total += loss
         n += 1
     return total / n if n else float("nan")
 
@@ -175,13 +265,15 @@ def _prediction_rows(spec, pred, labels, mask, pids, days, scaler) -> pd.DataFra
 
 @torch.no_grad()
 def run_split(model, loader, layout, spec, loss_fn, device, *, c_index_samples: int, survival_sampling: str,
-              mtl=None, mtl_batch_size: int = 0, scaler=None, save_predictions: bool = False) -> Dict:
+              mtl=None, mtl_batch_size: int = 0, scaler=None, save_predictions: bool = False,
+              window_batch_size: int = DEFAULT_WINDOW_BATCH_SIZE) -> Dict:
     """Chronicle's evaluate() for one task (and its Trainer._validate loss for model selection).
 
     One full GRU pass per patient gives the output at every observed day. Survival: loss on one
     random labelled day per patient per batch, C-index mean ± std over `c_index_samples` draws.
     Regression: Pearson r, binary: ROC-AUC, both over every labelled day and on the scaled
     values, as in Chronicle. A metric that cannot be computed is omitted, not NaN.
+    With --max_seq_len (in the layout) every day is predicted from its own window instead.
     """
     model.eval()
     target = spec["target"]
@@ -193,7 +285,12 @@ def run_split(model, loader, layout, spec, loss_fn, device, *, c_index_samples: 
 
     for batch in loader:
         lengths = batch["lengths"]
-        out = model(densify(batch, layout["static_dim"], layout["n_dynamic"], device)).float().cpu()
+        cov = densify(batch, layout, device)
+        if history_cap(layout):
+            out = capped_outputs(model, cov, lengths, layout, window_batch_size)
+        else:
+            out = model(cov)
+        out = out.float().cpu()
         pred = out.unsqueeze(-1)  # [B, T, 1]
         labels = batch["labels"]
         mask = valid_mask(lengths, out.shape[1])
@@ -293,8 +390,13 @@ def write_outputs(out_dir: str, split: str, spec, result: Dict):
 # --------------------------------------------------------------------------- #
 
 def main(args):
+    args.out_dir = args.out_dir.replace("{target}", args.target)
     if args.epochs < 1:
         raise ValueError("--epochs must be at least 1.")
+    if args.max_seq_len < 0:
+        raise ValueError("--max_seq_len must be 0 (whole history) or positive.")
+    if args.window_batch_size < 1:
+        raise ValueError("--window_batch_size must be at least 1.")
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -315,6 +417,8 @@ def main(args):
         recurrent=spec["recurrent"],
         static_features=split_list(args.static_features),
         input_features=split_list(args.input_features) or None,
+        time_features=args.time_features,
+        max_seq_len=args.max_seq_len,
     )
 
     scaler_dir = args.scaler_dir or os.path.join(args.data, "scalers")
@@ -340,7 +444,7 @@ def main(args):
     test_loader = make_loader(datasets["test"], eval_bs, False, False, args.num_workers)
 
     model_cfg = {
-        "cov_dim": layout["static_dim"] + layout["n_dynamic"] + 2,
+        "cov_dim": layout["static_dim"] + layout["n_dynamic"] + len(time_feature_names(layout)),
         "static_dim": layout["static_dim"],
         "latent_dim": args.latent_dim,
         "rnn_layers": args.rnn_layers,
@@ -365,6 +469,7 @@ def main(args):
         json.dump({"args": vars(args), "spec": spec, "model": model_cfg, "scaler_dir": scaler_dir,
                    "scaler_fingerprint": fingerprint, "static": layout["static"],
                    "n_dynamic": layout["n_dynamic"], "presence_only": layout["presence_only"],
+                   "time_features": layout["time_features"], "max_seq_len": layout["max_seq_len"],
                    "vocab": layout["vocab"]}, f, indent=2)
     pd.DataFrame(layout["columns"]).to_csv(os.path.join(args.out_dir, "features.csv"), index=False)
 
@@ -382,7 +487,8 @@ def main(args):
     for epoch in range(1, args.epochs + 1):
         train_loss = train_epoch(model, train_loader, layout, spec, loss_fn, mtl, opt, device, args)
         val = run_split(model, val_loader, layout, spec, loss_fn, device, c_index_samples=args.c_index_samples,
-                        survival_sampling=args.survival_sampling, mtl=mtl, mtl_batch_size=args.batch_size)
+                        survival_sampling=args.survival_sampling, mtl=mtl, mtl_batch_size=args.batch_size,
+                        window_batch_size=args.window_batch_size)
         value = selection_value(spec, val, args.selection_metric)
         history.append({"epoch": epoch, "train_loss": train_loss, "val_loss": val["val_loss"],
                         "selection_value": value, **{f"val_{k}": v.get(args.target) for k, v in val["metrics"].items()
@@ -415,7 +521,8 @@ def main(args):
     model.load_state_dict(torch.load(eval_path, map_location=device, weights_only=False)["model"])
 
     test = run_split(model, test_loader, layout, spec, loss_fn, device, c_index_samples=args.c_index_samples,
-                     survival_sampling=args.survival_sampling, scaler=scaler, save_predictions=True)
+                     survival_sampling=args.survival_sampling, scaler=scaler, save_predictions=True,
+                     window_batch_size=args.window_batch_size)
     write_outputs(args.out_dir, "test", spec, test)
     with open(os.path.join(args.out_dir, "training_summary.json"), "w") as f:
         json.dump({"best_epoch": best_epoch, "best_value": None if best_epoch is None else best,
@@ -424,11 +531,20 @@ def main(args):
     print(f"\n✅ Test {metric_text(spec, test['metrics'])} | saved to {args.out_dir}")
 
 
+REQUIRED = ("data", "global_format")
+
+
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser()
-    p.add_argument("--data", type=str, required=True, help="Chronicle cohort dir with <prefix>_{train,val,test}.csv")
-    p.add_argument("--global_format", type=str, required=True, help="Chronicle feature schema CSV")
-    p.add_argument("--out_dir", type=str, default="results_os")
+    # No abbreviations: "--conf x" must not be taken as --config by one parser and missed by the other.
+    p = argparse.ArgumentParser(allow_abbrev=False)
+    p.add_argument("--config", type=str, default="",
+                   help="YAML file with any of the options below (keys without '--'); the command line overrides it")
+    # required, from the command line or --config (checked after both are merged)
+    p.add_argument("--data", type=str, default="",
+                   help="(required) Chronicle cohort dir with <prefix>_{train,val,test}.csv")
+    p.add_argument("--global_format", type=str, default="", help="(required) Chronicle feature schema CSV")
+    p.add_argument("--out_dir", type=str, default="results_os",
+                   help="output directory; {target} is replaced by the target, e.g. results_os/{target}")
     p.add_argument("--scaler_dir", type=str, default="", help="scalers of the cohort; empty = <data>/scalers")
     p.add_argument("--seed", type=int, default=42)
 
@@ -445,6 +561,14 @@ def build_parser() -> argparse.ArgumentParser:
     # Inputs
     p.add_argument("--static_features", type=str, default=",".join(DEFAULT_STATIC_FEATURES))
     p.add_argument("--input_features", type=str, default="", help="comma list; empty = every schema feature in the data")
+    p.add_argument("--time_features", type=str, default="both", choices=sorted(TIME_FEATURE_CHOICES),
+                   help="time inputs of the GRU: both = years since diagnosis and since the previous observed day; "
+                        "none = no time input, as in the original CHRONOS")
+    p.add_argument("--max_seq_len", type=int, default=0,
+                   help="0 = the whole history; N = each prediction only sees the last N observed days "
+                        "(60 = the original CHRONOS default)")
+    p.add_argument("--window_batch_size", type=int, default=DEFAULT_WINDOW_BATCH_SIZE,
+                   help="only with --max_seq_len: windows per forward pass; lower it if memory runs out")
 
     # CHRONOS defaults (src/chronos/train.py)
     p.add_argument("--epochs", type=int, default=10)
@@ -465,5 +589,9 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    return parse_with_config(build_parser(), REQUIRED, argv)
+
+
 if __name__ == "__main__":
-    main(build_parser().parse_args())
+    main(parse_args())

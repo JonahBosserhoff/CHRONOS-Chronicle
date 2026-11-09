@@ -6,6 +6,7 @@
     3. scale the external cohort with them, exactly as `chronicle-preprocess --pretrained-scaler-dir`
        does (features and regression targets; categoricals, survival times and 0/1 targets stay)
     4. build the daily sequences with the TRAINING layout and run inference; nothing is fitted
+       (the layout also fixes the training run's --time_features and --max_seq_len)
 
 Outputs in --out_dir, in Chronicle's format:
 
@@ -30,13 +31,13 @@ the command line override the file:
 import argparse
 import json
 import os
-import sys
 from typing import List, Optional
 
 import pandas as pd
 import torch
 
 from chronicle_compat import FeatureScalers, loss_for, scaler_fingerprint
+from cli_config import parse_args as parse_with_config
 from dataset_os import (
     KEY_COL,
     PATIENT_ID_COL,
@@ -45,12 +46,22 @@ from dataset_os import (
     ChronicleOSDataset,
     build_vocab,
     describe,
+    describe_history,
+    time_feature_names,
     encode_split,
     read_cohort_csv,
     read_schema,
     resolve_raw_csv,
 )
-from train_os import build_model, make_loader, metric_text, run_split, set_seed, write_outputs
+from train_os import (
+    DEFAULT_WINDOW_BATCH_SIZE,
+    build_model,
+    make_loader,
+    metric_text,
+    run_split,
+    set_seed,
+    write_outputs,
+)
 
 
 def main(args):
@@ -62,6 +73,7 @@ def main(args):
     set_seed(args.seed if args.seed is not None else train_args["seed"])
     print(f"Checkpoint {args.checkpoint} (epoch {ckpt['epoch']}): target {spec['target']!r} ({spec['task']}, "
           f"{spec['loss']})")
+    print(f"Inputs as in training: time features {time_feature_names(layout) or 'none'} | {describe_history(layout)}")
 
     # ---- scalers of the training cohort ----------------------------------- #
     scaler_dir = args.scaler_dir or ckpt["scaler_dir"]
@@ -137,6 +149,7 @@ def main(args):
         survival_sampling=train_args["survival_sampling"],
         scaler=scalers,
         save_predictions=True,
+        window_batch_size=train_args.get("window_batch_size", DEFAULT_WINDOW_BATCH_SIZE),
     )
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -176,57 +189,8 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def config_argv(path: str, parser: argparse.ArgumentParser) -> List[str]:
-    """The options of a YAML file as command-line arguments, so argparse converts and checks them.
-
-    Keys are the option names without '--'. null keeps the default. Strings get ~ and $VARS
-    expanded; relative paths stay relative to the working directory, as on the command line.
-    """
-    import yaml  # only needed with --config
-
-    with open(path) as f:
-        cfg = yaml.safe_load(f)
-    if cfg is None:
-        return []
-    if not isinstance(cfg, dict):
-        raise ValueError(f"{path}: expected a mapping of option: value, got {type(cfg).__name__}.")
-
-    options = {a.dest: a for a in parser._actions if a.option_strings and a.dest not in ("help", "config")}
-    unknown = sorted(str(k) for k in cfg if k not in options)
-    if unknown:
-        raise ValueError(f"{path}: unknown option(s) {unknown}. Valid: {sorted(options)}.")
-
-    argv = []
-    for key, value in cfg.items():
-        if value is None:
-            continue
-        action = options[key]
-        flag = action.option_strings[0]
-        if isinstance(action, argparse.BooleanOptionalAction):
-            if not isinstance(value, bool):
-                raise ValueError(f"{path}: {key} must be true or false, got {value!r}.")
-            argv.append(flag if value else f"--no-{flag[2:]}")
-        elif isinstance(value, (bool, list, dict)):
-            raise ValueError(f"{path}: {key} takes a single value, got {value!r}.")
-        else:
-            value = os.path.expandvars(os.path.expanduser(value)) if isinstance(value, str) else str(value)
-            argv += [flag, value]
-    return argv
-
-
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
-    parser = build_parser()
-    argv = sys.argv[1:] if argv is None else list(argv)
-    pre = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
-    pre.add_argument("--config", type=str, default="")
-    config = pre.parse_known_args(argv)[0].config
-    if config:
-        argv = config_argv(config, parser) + argv  # later arguments win: the command line overrides the file
-    args = parser.parse_args(argv)
-    missing = [name for name in REQUIRED if not getattr(args, name)]
-    if missing:
-        parser.error(f"missing {', '.join('--' + m for m in missing)} (on the command line or in --config)")
-    return args
+    return parse_with_config(build_parser(), REQUIRED, argv)
 
 
 if __name__ == "__main__":

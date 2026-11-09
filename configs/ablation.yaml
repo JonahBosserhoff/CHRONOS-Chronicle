@@ -1,0 +1,33 @@
+# Feature ablation of the trained models (src/chronos/feature_ablation_os.py): every target that
+# has a model, every masking level, in one run.
+#
+#   python src/chronos/feature_ablation_os.py --config configs/ablation.yaml
+#   python src/chronos/feature_ablation_os.py --config configs/ablation.yaml --repeats 10   # command line overrides the file
+#
+# Keys are the options of feature_ablation_os.py without "--". null = the default named in the
+# comment. Relative paths resolve from the directory the command runs in (the repository root).
+# ~ and $VARS are expanded. The models' own settings (time_features, max_seq_len, ...) come from
+# their checkpoints.
+
+# ---- data and models --------------------------------------------------------------------------
+data: /homes/jbosserhoff/Chronicle/data/essen_revision_dataset   # the cohort dir the models were trained on; its test split is evaluated
+models_dir: results_os               # models at <models_dir>/<target>/checkpoints/<checkpoint_name>
+checkpoint_name: best_model.pt       # or last_model.pt
+out_dir: results_os/feature_ablation
+overwrite: false                     # true = replace the results of an earlier ablation in out_dir
+
+# ---- which targets ----------------------------------------------------------------------------
+targets: null                        # comma list; null = every target of the test split (<X>_TIME/<X>_EVENT, label*);
+                                     # a target without a model is skipped
+binary_label_cols: label_supportive_care_transfusion_7_days,label_febrile_neutropenia_21d   # only to find targets not starting with "label"
+
+# ---- masking ----------------------------------------------------------------------------------
+percents: 10,20,30,40,50,60,70,80,90   # masking levels in %, each strictly between 0 and 100
+repeats: 1                           # independent random masks per level (each level and repeat is drawn anew)
+mask_static: true                    # false = age and sex are never masked
+seed: 42                             # masks and C-index draws
+
+# ---- inference --------------------------------------------------------------------------------
+eval_batch_size: 0                   # 0 = the training run's
+c_index_samples: null                # null = the training run's
+num_workers: 0

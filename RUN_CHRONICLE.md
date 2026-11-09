@@ -2,16 +2,21 @@
 
 The CHRONOS backbone as a single-target benchmark for Chronicle: one model per target, trained
 and scored like Chronicle (same patients, features, scaling, labels, losses and metrics), plus
-external validation on another cohort. Standalone: nothing is imported from Chronicle.
+external validation on another cohort and a feature ablation. Standalone: nothing is imported
+from Chronicle.
 
 ```text
 src/chronos/train_os.py          train on the Chronicle splits, evaluate on test
 src/chronos/validate_os.py       external validation of a trained model
+src/chronos/feature_ablation_os.py  feature ablation of the trained models on the test split
 src/chronos/dataset_os.py        Chronicle long format -> one timestep per observed day
 src/chronos/chronicle_compat.py  Chronicle code copied verbatim (losses, metrics, scalers)
 src/chronos/model.py             + CHRONOSSingleTaskModel (CHRONOSModel itself is unchanged)
+src/chronos/cli_config.py        --config: options from a YAML file (shared by the three scripts)
+configs/train.yaml               options of a training run (template)
 configs/validate_external.yaml   options of an external validation (template)
-slurm/{train,validate}.sbatch    training and external validation as SLURM jobs (section 4)
+configs/ablation.yaml            options of the feature ablation (template)
+slurm/{train,validate}.sbatch    training and external validation as SLURM jobs (section 5)
 ```
 
 ## Install
@@ -20,7 +25,7 @@ slurm/{train,validate}.sbatch    training and external validation as SLURM jobs 
 pip install numpy pandas torch scikit-learn lifelines pyarrow joblib pyyaml
 ```
 
-`pyyaml` is only needed for `validate_os.py --config`. Chronicle itself does not need to be
+`pyyaml` is only needed for `--config` (section 2). Chronicle itself does not need to be
 installed.
 
 Run every command from the repository root.
@@ -57,6 +62,21 @@ python src/chronos/train_os.py \
   --out_dir results_os/OS
 ```
 
+or with the options in a YAML file (template: [`configs/train.yaml`](configs/train.yaml), which
+lists every option below with its default):
+
+```bash
+python src/chronos/train_os.py --config configs/train.yaml                 # the target of the file
+python src/chronos/train_os.py --config configs/train.yaml --target TTNT   # command line overrides the file
+```
+
+Keys are the option names without `--`; `null` keeps an option's default, `~` and `$VARS` are
+expanded, relative paths resolve from the working directory, and unknown keys or values of the
+wrong type are refused. The same holds for `validate_os.py --config` and
+`feature_ablation_os.py --config`. `{target}` in `--out_dir` becomes the target, so
+`out_dir: results_os/{target}` serves every target with one file, and puts each model where the
+feature ablation looks for it.
+
 `--target` is any target of the cohort, one per run. The type follows Chronicle's rule
 (`Config.finalize_losses`):
 
@@ -75,10 +95,11 @@ and metric, as in Chronicle.
 
 | option | default | meaning |
 |---|---|---|
+| `--config` | none | YAML file with any of the options below |
 | `--data` | (required) | Chronicle's cohort directory: `<prefix>_{train,val,test}.csv` and `scalers/` (section 1) |
 | `--global_format` | (required) | Chronicle feature schema |
 | `--target` | `OS` | the one target of this run |
-| `--out_dir` | `results_os` | output directory |
+| `--out_dir` | `results_os` | output directory; `{target}` in it becomes the target |
 | `--scaler_dir` | `<data>/scalers` | scalers of the cohort: inverse transform of regression predictions, recorded for external validation |
 | `--binary_label_cols` | `label_supportive_care_transfusion_7_days,label_febrile_neutropenia_21d` | as `binary_label_cols` in Chronicle's `configs/train.yaml` |
 | `--recurrent_survival_targets` | `TTNT` | as `recurrent_survival_targets` in `train.yaml` |
@@ -88,6 +109,9 @@ and metric, as in Chronicle.
 | `--survival_sampling` | `random` | `random` or `last` labelled day per patient (Chronicle's `survival_sampling`) |
 | `--static_features` | `age_at_diagnosis,gender_female` | features that go to the static MLP instead of the GRU |
 | `--input_features` | empty = all | restrict the vocabulary, like Chronicle's `input_features` |
+| `--time_features` | `both` | time inputs of the GRU: `both` = years since diagnosis and years since the previous observed day, `since_diagnosis` = only the first, `none` = no time input, as in the original CHRONOS |
+| `--max_seq_len` | `0` = whole history | `N` = each prediction only sees the patient's last `N` observed days (that day included). `60` = the original CHRONOS default |
+| `--window_batch_size` | `8192` | only with `--max_seq_len`: windows per forward pass. Lower it if memory runs out; the result does not depend on it |
 | `--epochs` | `10` | CHRONOS default |
 | `--batch_size` | `1024` | CHRONOS default. For survival also the Cox risk set. Must not exceed the train split, because incomplete batches are dropped |
 | `--eval_batch_size` | `0` = `batch_size` | val / test / external batch size. Lower it if long patients run out of memory |
@@ -98,13 +122,43 @@ and metric, as in Chronicle.
 | `--selection_metric` | `auto` | `auto` = the target's metric on val (C-index / Pearson r / AUC), `val_loss` = validation loss |
 | `--early_stopping_patience` | `0` = off | the best val epoch is evaluated either way |
 
+### Closer to the original CHRONOS (optional)
+
+By default the GRU sees the whole history since diagnosis and two time features. Both go beyond
+the original CHRONOS, whose GRU had no time input and saw at most `max_seq_len = 60` visit days.
+Two options switch them off, separately or together. The defaults stay as they are:
+
+```bash
+python src/chronos/train_os.py \
+  --data <cohort_dir> --global_format <schema.csv> --target OS --out_dir results_os/OS_orig \
+  --time_features none --max_seq_len 60
+```
+
+- `--time_features none` removes both time columns. A day still is one GRU step, but the GRU
+  no longer gets the time since diagnosis or the gap between days. `since_diagnosis` keeps only
+  the first of the two.
+- `--max_seq_len N` caps the history per prediction: the output at a day comes from a GRU pass
+  from a fresh state over the patient's last `N` observed days, that day included (a sliding
+  window per day; the static MLP input is the same for every window). This is the original
+  `max_seq_len` (keep the last 60 steps), applied to every day Chronicle predicts on. It applies
+  to training (every labelled day, or the drawn survival day), model selection, test,
+  `validate_os.py` and `feature_ablation_os.py`. With time features, the gap to the previous day
+  at the start of a window is the real one, also when that day lies before the window. The
+  original 180-day baseline window is not taken over: the cap counts observed days, not
+  calendar days.
+
+Both settings are stored in the checkpoint's input layout; external validation and the feature
+ablation use those of the training run. Each window is its own GRU pass, so `--max_seq_len`
+costs about `N` times the compute of the whole-history default. With `--max_seq_len` at least
+the longest patient, the results equal those of the default (checked numerically).
+
 ### Outputs (`--out_dir`)
 
 | file | content |
 |---|---|
 | `metrics_test.json` | Chronicle's format: `split_size, num_batches, loss, c_index, c_index_std, correlation, auc`. A metric that cannot be computed is omitted |
 | `predictions_test/<target>.parquet` | one row per (patient, day). Survival: `patient_id, day, prediction, time, event` (higher prediction = higher hazard). Regression / binary: `patient_id, day, prediction, ground_truth`, unlabelled days dropped. Regression in original units, binary as logit |
-| `checkpoints/best_model.pt`, `last_model.pt` | weights, input layout, target, training arguments, path and sha256 of the scalers |
+| `checkpoints/best_model.pt`, `last_model.pt` | weights, input layout (including `--time_features` and `--max_seq_len`), target, training arguments, path and sha256 of the scalers |
 | `history.csv`, `training_summary.json` | per-epoch losses and val metric; best epoch and the evaluated checkpoint |
 | `config.json`, `features.csv` | run configuration; one row per input column (feature, value / observed / present / time) |
 
@@ -127,7 +181,8 @@ python src/chronos/validate_os.py \
 3. Scales the external cohort with them (the only scaling CHRONOS does), exactly as
    `chronicle-preprocess --pretrained-scaler-dir` does: continuous features and regression targets are transformed. Categoricals, survival times
    and 0/1 targets stay unchanged. Nothing is fitted on the external cohort.
-4. Builds the daily sequences with the training layout and runs inference.
+4. Builds the daily sequences with the training layout and runs inference, with the training
+   run's `--time_features` and `--max_seq_len`.
 
 The external cohort is the **raw, unscaled** CSV, prepared like the training cohort before
 preprocessing (outliers removed, labels created with the same rules), with the target's
@@ -164,7 +219,81 @@ Chronicle would predict on: every day with an observation of a schema feature. A
 observations are features unknown to the model still gets a prediction, from the history so far
 and the time features.
 
-## 4. On SLURM
+## 4. Feature ablation
+
+How much does each model lose when part of the features is missing? For every target that has a
+model and every masking level (10, 20, ..., 90 %), a random part of the features is masked in the
+test split and the model is scored again. Everything (all targets, all levels) runs with one
+command:
+
+```bash
+python src/chronos/feature_ablation_os.py --config configs/ablation.yaml
+```
+
+or without the YAML:
+
+```bash
+python src/chronos/feature_ablation_os.py \
+  --data <cohort_dir> \
+  --models_dir results_os \
+  --out_dir results_os/feature_ablation
+```
+
+1. Finds the targets: every target of the test split (`<X>_TIME` with `<X>_EVENT`, `label*`
+   columns), or `--targets`. The model of a target is
+   `<models_dir>/<target>/checkpoints/best_model.pt` (as `out_dir: results_os/{target}` of
+   `configs/train.yaml` writes it). **A target without a model is skipped** (logged, and listed
+   in `feature_ablation_config.json`).
+2. Loads every model and checks it before any inference: the checkpoint belongs to that
+   target, and the cohort's `scalers/` are those the model was trained with (when both the
+   checkpoint and the cohort have scalers). After encoding, the test split must have as many
+   patients as the model's own `metrics_test.json` (when it exists).
+3. For every level `p` (and every repeat): draws `k = round(p/100 · N)` of the `N` features of
+   the model's vocabulary (the schema features that occur anywhere in the cohort: train, val and
+   test), at random. **Every mask is drawn anew**, independently of the other levels and
+   repeats (the 20 % mask does not build on the 10 % one). Each (`seed`, repeat, level) has its
+   own random stream, so a mask does not depend on what else is run, and models with the same
+   vocabulary get the same mask for the same (repeat, level).
+4. Masks those features in the test inputs: every observation of them is removed, so they look
+   like a feature that was never measured (value 0 and observed mask 0; presence-only features
+   not present; static features `[0, 0]`). Static features (age, sex) are part of the draw
+   unless `--no-mask_static`.
+5. Runs inference on the test split and computes the target's metric (C-index / Pearson r /
+   AUC) exactly as the test evaluation of `train_os.py`: same patients, days, labels, time
+   features, `--max_seq_len`, batch size and C-index protocol. A day whose observations are all
+   masked is kept, so every level is scored on the same (patient, day) points. The C-index draws
+   are re-seeded with `--seed` before every evaluation.
+
+0 % and 100 % are not run. The unmasked reference is the model's `metrics_test.json` (AUC and
+Pearson r identical; the C-index differs only by its random draws). One random mask per level
+depends a lot on which features it hits; `--repeats R` evaluates every level with `R`
+independent masks and reports mean and std over them.
+
+| option | default | meaning |
+|---|---|---|
+| `--config` | none | YAML file with any of the options below (template: [`configs/ablation.yaml`](configs/ablation.yaml)) |
+| `--data` | (required) | the cohort directory the models were trained on; its `<prefix>_test.csv` is evaluated |
+| `--models_dir` | `results_os` | models at `<models_dir>/<target>/checkpoints/<checkpoint_name>` |
+| `--checkpoint_name` | `best_model.pt` | or `last_model.pt` |
+| `--out_dir` | `results_os/feature_ablation` | refused if it already holds ablation results, unless `--overwrite` |
+| `--targets` | all targets of the test split | comma list |
+| `--binary_label_cols` | as in `train_os.py` | only to find targets that do not start with `label`; each model knows its own task |
+| `--percents` | `10,20,30,40,50,60,70,80,90` | masking levels in %, each strictly between 0 and 100 |
+| `--repeats` | `1` | independent random masks per level |
+| `--mask_static` / `--no-mask_static` | on | age and sex can be masked like every other feature |
+| `--seed` | `42` | masks and C-index draws |
+| `--eval_batch_size`, `--c_index_samples` | from the training run | |
+
+Outputs (`--out_dir`), rewritten after every evaluation, so an interrupted run keeps what it has:
+
+| file | content |
+|---|---|
+| `feature_ablation.csv` | one row per (target, repeat, percent): `metric`, `value`, `value_std` (std over the C-index draws, survival only), `loss`, `n_features`, `n_masked`, `n_patients` |
+| `feature_ablation_summary.csv` | per (target, percent): `mean`, `std` over the repeats, `n_repeats` |
+| `feature_ablation_masks.csv` | the masked features of every (target, repeat, percent) |
+| `feature_ablation_config.json` | options, evaluated checkpoints, skipped targets and why |
+
+## 5. On SLURM
 
 Two job scripts in `slurm/`, submitted from the repository root. The SLURM log goes to
 `logs/`, which must exist before submitting. Settings are passed as environment variables with
@@ -196,7 +325,7 @@ The `#SBATCH` resources (partition `gpu_nodes` as in Chronicle's job scripts, 1 
 GPU, 64 GB, 24 h for training, 4 h for validation) are defaults; override
 them on the command line, e.g. `sbatch --time=48:00:00 --partition=<p> ...`.
 
-## 5. Design changes compared with the original CHRONOS
+## 6. Design changes compared with the original CHRONOS
 
 Unchanged files: `dataset.py`, `train.py`, `run_all_trials.py`, `experiment_suite.py`,
 `baseline_compare.py`, `cox_baseline.py`, `run_all_cox.py`. In `model.py`, `CHRONOSModel`, the
@@ -208,9 +337,9 @@ subclass. The causal pipeline runs and reproduces as before.
 | question | causal effect A → B of one disease edge | prediction of one Chronicle target per (patient, day) |
 | input data | event CSV: `CODICE_FISCALE_ASSISTITO, DATA_PRESCRIZIONE` (calendar date), `ICD9_CM` mapped to 16 macro categories, ATC as `DRUG:`, `ANNO_NASCITA, SESSO, FRAILTY_SUM, DATA_REVOCA` | Chronicle's own split CSVs, read unchanged (long format): `patient_id, feature_name, feature_value, time_since_initial_diagnosis` plus label columns. Values scaled with train-fitted scalers |
 | cohort | target-trial emulation: first A after ≥180 days of history, contact in the last 60 days, washouts (A 180 d, B 30 d), follow-up not cut by `DATA_REVOCA`, 1:3 controls with the same t0, ≥50 treated | no emulation: every patient of Chronicle's train / val / test split |
-| time axis | visit days in [t0−180, t0], at most 60 steps, plus one appended follow-up step | every observed day since diagnosis (a day with an observation of a vocabulary feature), no cap |
+| time axis | visit days in [t0−180, t0], at most 60 steps, plus one appended follow-up step | every observed day since diagnosis (a day with an observation of a vocabulary feature), no cap. Optional: `--max_seq_len 60`, the last 60 observed days per prediction |
 | static MLP input (`static_dim`) | 3: birth year min-max normalised, `FRAILTY_SUM/10`, sex (M 1 / F 0 / unknown 0.5) | 4: `[value, observed]` of `age_at_diagnosis` and `gender_female` (their first observed value, scaled as in Chronicle) |
-| GRU input per step | count of B in the baseline / 20 and visits in the last 30 days / 10 (both computed at t0, identical at every step), plus A of the previous step | per vocabulary feature the last value of the day and an observed mask (one presence column for categoricals that only occur as 1), plus years since diagnosis and years since the previous observed day. The treatment input is empty |
+| GRU input per step | count of B in the baseline / 20 and visits in the last 30 days / 10 (both computed at t0, identical at every step), plus A of the previous step | per vocabulary feature the last value of the day and an observed mask (one presence column for categoricals that only occur as 1), plus years since diagnosis and years since the previous observed day (optional: `--time_features since_diagnosis` / `none`). The treatment input is empty |
 | missing values | n/a | 0 with mask 0, nothing imputed; earlier values are carried by the GRU state |
 | encoder | static MLP + GRU + fusion + LayerNorm | unchanged (same layers and sizes) |
 | heads | `mu0`, `mu1`, propensity | removed. One head with the structure of `mu0` (Linear–GELU–Dropout–Linear) and one output per step: log-risk / value / logit |
@@ -226,9 +355,10 @@ arguments have no counterpart without an exposure and are gone: `--treatment_cod
 `--outcome_codes`, `--t0_codes`, all windows / washouts, `--control_ratio`, `--min_treated`,
 `--n_folds`, `--alpha`, `--beta`, `--gamma`, `--lambda_prop`, `--perc`, `--margin`, `--max_pairs`,
 `--use_mine`, `--mine_interval`, `--critic_steps`, `--weighted_sampling`, `--ps_eps`,
-`--add_qvalues`. `--max_seq_len` (60) is not used, so the whole history is seen.
+`--add_qvalues`. `--max_seq_len` is kept as an option, but its default is now `0`: the whole
+history is seen. `--max_seq_len 60` restores the original cap (section 2).
 
-## 6. What is taken from Chronicle, and what still differs
+## 7. What is taken from Chronicle, and what still differs
 
 Copied verbatim into `chronicle_compat.py`, with the source in the module docstring:
 - `cox_loss`, the loss registry (`mse`, `l1`, `huber`, `bce_logits`) and the target-type rule.
@@ -247,9 +377,10 @@ Differences to Chronicle that remain on purpose (model and training, not data or
   values of one feature on the same day become the last one.
 - **No augmentation:** Chronicle drops features / observations during training
   (`mask_augmentation`). CHRONOS has no augmentation.
-- **No sequence cap:** Chronicle trains on at most 4000 observations (random subsample) and
-  evaluates the most recent 30000. CHRONOS always sees the whole history. For a patient with more
-  than 30000 observations, Chronicle has no prediction on the earliest days. A join on
+- **No sequence cap (default):** Chronicle trains on at most 4000 observations (random subsample)
+  and evaluates the most recent 30000. By default CHRONOS sees the whole history;
+  `--max_seq_len` caps it at the last `N` observed days per prediction instead. For a patient
+  with more than 30000 observations, Chronicle has no prediction on the earliest days. A join on
   `(patient_id, day)` drops those days.
 - **Training setup:** Chronicle trains 10 targets jointly with uncertainty weighting, Adam
   (`weight_decay 1e-6`), cosine annealing, AMP, 100 epochs with patience 20, batch 128. CHRONOS

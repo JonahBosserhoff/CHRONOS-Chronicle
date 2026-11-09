@@ -1,0 +1,50 @@
+# Training of one CHRONOS model per target (src/chronos/train_os.py).
+#
+#   python src/chronos/train_os.py --config configs/train.yaml                 # target below
+#   python src/chronos/train_os.py --config configs/train.yaml --target TTNT   # another target
+#
+# Keys are the options of train_os.py without "--". Options given on the command line override
+# this file. null = the default named in the comment. Relative paths resolve from the directory
+# the command runs in (the repository root). ~ and $VARS are expanded. {target} in out_dir becomes
+# the target, so one file serves every target (and feature_ablation_os.py finds the models under
+# results_os/<target>/).
+
+# ---- data -------------------------------------------------------------------------------------
+data: /homes/jbosserhoff/Chronicle/data/essen_revision_dataset            # Chronicle's cohort dir: <prefix>_{train,val,test}.csv, scalers/
+global_format: /homes/jbosserhoff/Chronicle/data/global_format_essen_12_03.csv   # Chronicle's feature schema
+scaler_dir: null             # null = <data>/scalers
+out_dir: results_os/{target}
+
+# ---- target (Chronicle's rules: binary_label_cols -> BCE, label* -> regression, else survival) ---
+target: OS
+binary_label_cols: label_supportive_care_transfusion_7_days,label_febrile_neutropenia_21d   # comma list
+recurrent_survival_targets: TTNT   # comma list; survival targets that restart per episode
+regression_loss: mse         # mse | l1 | huber
+loss_mode: static            # static | uncertainty (Chronicle's learned uncertainty weighting)
+logvar_prior: 1.0            # only for loss_mode uncertainty
+logvar_bounds: [-8.0, 8.0]   # only for loss_mode uncertainty
+survival_sampling: random    # random | last labelled day per patient
+
+# ---- inputs -----------------------------------------------------------------------------------
+static_features: age_at_diagnosis,gender_female   # comma list; go to the static MLP instead of the GRU
+input_features: null         # comma list to restrict the vocabulary; null = every schema feature in the data
+time_features: both          # both | since_diagnosis | none (none = no time input, as in the original CHRONOS)
+max_seq_len: 0               # 0 = whole history; N = each prediction sees the last N observed days (60 = original CHRONOS)
+window_batch_size: 8192      # only with max_seq_len > 0: windows per forward pass; lower it if memory runs out
+
+# ---- model and optimisation (CHRONOS defaults) ------------------------------------------------
+epochs: 10
+batch_size: 1024             # survival: also the Cox risk set; must not exceed the train split
+eval_batch_size: 0           # 0 = batch_size; lower it if long patients run out of memory
+latent_dim: 64
+rnn_layers: 1
+dropout: 0.1
+lr: 1.0e-3
+weight_decay: 1.0e-4
+num_workers: 0
+seed: 42
+
+# ---- evaluation (Chronicle's protocol) --------------------------------------------------------
+c_index_samples: 10          # survival: draws for the C-index mean ± std
+selection_metric: auto       # auto = C-index / Pearson r / AUC on val | val_loss
+early_stopping_patience: 0   # 0 = off; the best val epoch is evaluated either way
